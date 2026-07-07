@@ -244,6 +244,9 @@ input,select{font-family:inherit}
 .maxLink{font-size:11.5px;color:var(--gold);font-weight:600;margin-top:6px;display:inline-block;cursor:pointer}
 .maxLink:hover{text-decoration:underline}
 .pickEmpty{padding:12px 14px;background:#FAFBFC;border:1px dashed #DDE0E5;border-radius:9px;font-size:13px;color:#9AA0AA}
+.fifoNote{font-size:12px;color:#8A8F99;margin-bottom:8px}
+.fifoRow{display:flex;justify-content:space-between;gap:10px;padding:7px 12px;background:#FAFBFC;border:1px solid #EEF0F3;border-radius:8px;font-size:12.5px;color:#3A3F48;margin-bottom:6px}
+.fifoPl{font-size:13px;color:#4A4F58;margin-top:8px}.fifoPl b{font-size:15px;margin:0 4px}.fifoPl .dim{font-size:11.5px;margin-left:6px}
 select.fInput{appearance:none;-webkit-appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%239AA0AA' stroke-width='2'%3E%3Cpolyline points='6 9 12 15 18 9'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 12px center;background-size:16px;padding-right:36px}
 
 /* 帳戶管理 */
@@ -340,39 +343,54 @@ function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return
 function calcFee(value,s){if(!value||value<=0)return 0;var f=Math.floor(value*s.feeRate*s.feeDiscount);return f<s.minFee?s.minFee:f;}
 function calcTax(value,secType,tradeType,s){if(!value||value<=0)return 0;var r=secType==='etf'?s.taxEtf:s.taxStock;if(tradeType==='day'&&secType!=='etf')r=s.taxDayStock;return Math.floor(value*r);}
 
-/* ---------- 損益引擎 (移動平均) ---------- */
+/* ---------- 損益引擎 (先進先出 FIFO) ---------- */
 function computeEngine(txs,prices){
   var sorted=txs.slice().sort(function(a,b){if(a.date!==b.date)return a.date<b.date?-1:1;return a.id-b.id;});
   var pos={},realized=[],sellCount=0,winCount=0;
   for(var k=0;k<sorted.length;k++){
     var t=sorted[k],code=t.code;
-    if(!pos[code])pos[code]={name:t.name,shares:0,totalCost:0,finance:0};
+    if(!pos[code])pos[code]={name:t.name,lots:[]};
     var p=pos[code]; if(t.name)p.name=t.name;
     var gross=(t.shares||0)*(t.price||0),fee=t.fee||0,tax=t.tax||0;
-    if(t.type==='buy'){p.totalCost+=gross+fee;p.shares+=t.shares;p.finance+=(t.marginType==='margin'?(t.finance||0):0);}
+    if(t.type==='buy'){
+      // 每筆買進 = 一個批次;成本含手續費,融資按股攤
+      p.lots.push({date:t.date,txId:t.id,buyPrice:t.price||0,shares:t.shares,
+        cps:t.shares>0?(gross+fee)/t.shares:0,
+        fps:t.shares>0?((t.marginType==='margin'?(t.finance||0):0)/t.shares):0});
+    }
     else if(t.type==='sell'){
-      var avg=p.shares>0?p.totalCost/p.shares:0;
-      var costSold=avg*t.shares, proceeds=gross-fee-tax, pl=proceeds-costSold;
-      var finSold=p.shares>0?(p.finance/p.shares)*t.shares:0;
-      p.totalCost-=costSold; p.shares-=t.shares; p.finance-=finSold;
-      if(p.shares<1e-6){p.shares=0;p.totalCost=0;p.finance=0;}
+      // 先進先出:從最早批次開始沖銷
+      var remain=t.shares,costSold=0,finSold=0,lotsUsed=[];
+      while(remain>1e-6&&p.lots.length){
+        var lot=p.lots[0],take=Math.min(lot.shares,remain);
+        costSold+=take*lot.cps; finSold+=take*lot.fps;
+        lotsUsed.push({date:lot.date,shares:take,cps:lot.cps});
+        lot.shares-=take; remain-=take;
+        if(lot.shares<1e-6)p.lots.shift();
+      }
+      var proceeds=gross-fee-tax, pl=proceeds-costSold;
       sellCount++; if(pl>0)winCount++;
-      realized.push({id:t.id,date:t.date,code:code,name:p.name,kind:'trade',shares:t.shares,pl:pl});
+      realized.push({id:t.id,date:t.date,code:code,name:p.name,kind:'trade',shares:t.shares,pl:pl,lots:lotsUsed});
     } else if(t.type==='dividend'){
       var net=(t.amount||0)-(t.fee||0);
       realized.push({id:t.id,date:t.date,code:code,name:p.name,kind:'dividend',shares:0,pl:net});
     }
   }
   var holdings=[];
-  for(var c in pos){ if(!pos.hasOwnProperty(c))continue; var pp=pos[c]; if(pp.shares<=0)continue;
-    var avg2=pp.totalCost/pp.shares, cur=prices[c], has=(cur!=null&&cur!==''&&!isNaN(cur));
-    var mv=has?Number(cur)*pp.shares:null, upl=has?mv-pp.totalCost:null;
-    var fin=pp.finance>1?pp.finance:0, self=pp.totalCost-fin;
+  for(var c in pos){ if(!pos.hasOwnProperty(c))continue; var pp=pos[c];
+    var shSum=0,costSum=0,finSum=0,lotsOut=[];
+    for(var li=0;li<pp.lots.length;li++){var L=pp.lots[li];
+      shSum+=L.shares;costSum+=L.shares*L.cps;finSum+=L.shares*L.fps;
+      lotsOut.push({date:L.date,shares:L.shares,cps:L.cps,buyPrice:L.buyPrice,finance:L.shares*L.fps});}
+    if(shSum<=1e-6)continue;
+    var avg2=costSum/shSum, cur=prices[c], has=(cur!=null&&cur!==''&&!isNaN(cur));
+    var mv=has?Number(cur)*shSum:null, upl=has?mv-costSum:null;
+    var fin=finSum>1?finSum:0, self=costSum-fin;
     var maint=(fin>0&&has)?(mv/fin)*100:null;
-    holdings.push({code:c,name:pp.name,shares:pp.shares,avgCost:avg2,totalCost:pp.totalCost,
+    holdings.push({code:c,name:pp.name,shares:shSum,avgCost:avg2,totalCost:costSum,lots:lotsOut,
       finance:fin,selfCapital:self,maintenance:maint,isMargin:fin>0,
       curPrice:has?Number(cur):null,marketValue:mv,unrealized:upl,
-      unrealizedPct:(has&&pp.totalCost>0)?(upl/pp.totalCost)*100:null});
+      unrealizedPct:(has&&costSum>0)?(upl/costSum)*100:null});
   }
   holdings.sort(function(a,b){return b.totalCost-a.totalCost;});
   var byMonth={},byYear={};
@@ -616,7 +634,7 @@ function emptyState(){
   var cur=null;for(var i=0;i<state.portfolios.length;i++)if(state.portfolios[i].id===state.portfolio)cur=state.portfolios[i];
   return '<div class="empty"><div class="emptyMark">'+IC.logo+'</div>'+
     '<div class="emptyTitle">「'+esc(cur?cur.name:'此帳戶')+'」還沒有交易</div>'+
-    '<div class="emptyText">記錄每一筆買進、賣出與股利,系統會以移動平均成本法自動計算已實現損益,並彙整月報與年報。台股紅漲綠跌、手續費與證交稅自動試算。</div>'+
+    '<div class="emptyText">記錄每一筆買進、賣出與股利,系統會以先進先出(FIFO)自動沖銷最早買進的批次計算已實現損益,並彙整月報與年報。台股紅漲綠跌、手續費與證交稅自動試算。</div>'+
     '<div style="display:flex;gap:12px"><button class="btnPrimary" onclick="openModal()">'+IC.plus+'新增第一筆交易</button>'+
     '<button class="btnGhost" onclick="loadDemo()">'+IC.spark+'載入示範資料</button></div></div>';
 }
@@ -1025,6 +1043,7 @@ function renderModal(){
       var netLabel=d.type==='buy'?'含費用總成本':'實收淨額',net=d.type==='buy'?value+Number(d.fee||0):value-Number(d.fee||0)-Number(d.tax||0);
       body+='<div class="calcPreview"><div><span>成交金額</span><b class="mono" id="pvValue">'+fmtNT(value)+'</b></div>'+
         '<div><span>'+netLabel+'</span><b class="mono" id="pvNet">'+fmtNT(net)+'</b></div></div>';
+      if(d.type==='sell')body+='<div class="field full" id="fifoBox">'+fifoPreviewHtml()+'</div>';
     }
   } else {
     body+=field('現金股利總額','<input class="fInput mono" type="number" placeholder="2000" value="'+esc(d.amount)+'" oninput="dset({amount:this.value});updPreview()">');
@@ -1039,6 +1058,22 @@ function renderModal(){
     '<button class="btnPrimary" onclick="saveTx()">'+IC.check+(d.id?'儲存變更':'新增交易')+'</button></div></div></div>';
 }
 function field(label,inner,full){return '<label class="field'+(full?' full':'')+'"><span class="fLabel">'+label+'</span>'+inner+'</label>';}
+/* 賣出 FIFO 沖銷預覽:顯示會賣到哪幾批、預估已實現損益 */
+function fifoPreviewHtml(){
+  var d=draft;if(d.type!=='sell'||!d.code)return '';
+  var h=null,hs=state.engine.holdings;for(var i=0;i<hs.length;i++)if(hs[i].code===d.code)h=hs[i];
+  if(!h||!h.lots||!h.lots.length)return '';
+  var sh=d.unit==='張'?Number(d.shares||0)*1000:Number(d.shares||0);
+  if(sh<=0)return '<div class="fifoNote">依「先進先出」原則,將自最早買進的批次開始賣出:</div>'+
+    h.lots.map(function(L){return '<div class="fifoRow"><span class="mono">'+L.date+'</span><span class="mono">'+fmtShares(L.shares)+' 股</span><span class="mono dim">成本 '+fmtPrice(L.cps)+'</span></div>';}).join('');
+  var remain=sh,rows=[],costSold=0;
+  for(var j=0;j<h.lots.length&&remain>1e-6;j++){var L2=h.lots[j],take=Math.min(L2.shares,remain);
+    rows.push('<div class="fifoRow"><span class="mono">'+L2.date+'</span><span class="mono">賣 '+fmtShares(take)+' / '+fmtShares(L2.shares)+' 股</span><span class="mono dim">成本 '+fmtPrice(L2.cps)+'</span></div>');
+    costSold+=take*L2.cps;remain-=take;}
+  var value=sh*Number(d.price||0),proceeds=value-Number(d.fee||0)-Number(d.tax||0),pl=proceeds-costSold;
+  var plLine=Number(d.price||0)>0?'<div class="fifoPl">預估已實現損益 <b class="mono" style="color:'+plColor(pl)+'">'+fmtSign(pl)+'</b><span class="dim">(批次成本 '+fmtNT(costSold)+')</span></div>':'';
+  return '<div class="fifoNote">先進先出沖銷明細:</div>'+rows.join('')+plLine;
+}
 function updPreview(){
   var d=draft;
   if(d.type==='dividend'){var n=document.getElementById('pvNet');if(n)n.textContent=fmtNT(Number(d.amount||0)-Number(d.fee||0));return;}
@@ -1051,6 +1086,7 @@ function updPreview(){
   } else {
     var net=d.type==='buy'?value+Number(d.fee||0):value-Number(d.fee||0)-Number(d.tax||0);
     var nEl=document.getElementById('pvNet');if(nEl)nEl.textContent=fmtNT(net);
+    if(d.type==='sell'){var fb=document.getElementById('fifoBox');if(fb)fb.innerHTML=fifoPreviewHtml();}
   }
 }
 function saveTx(){
